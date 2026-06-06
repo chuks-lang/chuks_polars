@@ -1,0 +1,23 @@
+[package]
+name = "chuks_polars_shim"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+polars = { version = "0.46", features = [
+    "lazy",
+    "csv",
+    "parquet",
+    "dtype-full",
+    "random",
+    "is_in",
+    "strings",
+    "rows",
+    "describe",
+    "semi_anti_join",
+    "cross_join",
+] }
+serde_json = "1"

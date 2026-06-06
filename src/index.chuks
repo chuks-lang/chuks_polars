@@ -1,0 +1,1557 @@
+// chuks_polars — Polars DataFrame wrapper for Chuks.
+//
+// Polars is a column-oriented analytical engine implemented in Rust. This
+// package builds a thin Rust cdylib shim (in `chuks_polars/shim/`) on first
+// use via `r.cargoBuild(...)` and exposes a rich DataFrame API through
+// std/chuksToC.
+//
+// Usage:
+//   import { Polars } from "chuks_polars"
+//
+//   const pl = new Polars()
+//   const df = pl.readCsv("sales.csv")
+//
+//   println(df.height())                    // row count
+//   println(df.columns().join(", "))        // header names
+//
+//   const big = df.filter("amount", ">", "100")
+//   const agg = big.groupBy("category", "amount:sum,amount:mean,id:count")
+//   println(agg.toString())
+//
+//   const total: float = df.colSum("amount")
+//
+//   agg.close()
+//   big.close()
+//   df.close()
+//
+// Memory: every DataFrame returned by Polars/DataFrame methods owns
+// Rust-side heap state via `Box::into_raw`. Call `.close()` when done
+// (safe to call multiple times). String/buffer returns from the shim are
+// copied into Chuks strings and the underlying buffer is freed before
+// returning.
+//
+// List parameters are comma-separated:
+//   colsCsv  = "a,b,c"
+//   descCsv  = "1,0,1"          (1=desc, 0=asc; sortBy)
+//   pairsCsv = "old1=new1,old2=new2"     (rename)
+//   aggSpecs = "col:op,col:op"  (groupBy)
+//     ops: sum, mean (avg), min, max, count, std, var, median,
+//          first, last, n_unique (count_distinct)
+//   filter ops: eq (==), ne (!=), gt (>), lt (<), gte (>=), lte (<=)
+//   join how: inner, left, outer (full), cross, semi, anti
+//   unique keep: first, last, any, none
+
+import { c, LibHandle, CFunc, CPtr, CSig } from "std/chuksToC"
+import { Matrix } from "std/matrixContract"
+import { r } from "std/chuksToRust"
+import { fs } from "std/fs"
+
+// ── DataFrame handle (explicit close) ───────────────────────────────
+
+@iterationCost("warning", "Iterating a DataFrame row-by-row in Chuks is ~200-1000x slower than columnar materialization. Materialize first.", "df.series(name).toFloats() / .toStrings()", "df.matrix(cols).toCBuf() for ML pipelines", "df.toString() / df.head(n) for inspection")
+export class DataFrame {
+    var _ptr: CPtr
+    var _pl: Polars
+    var _closed: bool
+
+    constructor(ptr: CPtr, pl: Polars) {
+        this._ptr = ptr
+        this._pl = pl
+        this._closed = false
+    }
+
+    // ── Inspection ──────────────────────────────────────────────────
+
+    public height(): int {
+        this.__checkOpen()
+        return this._pl._heightOf(this._ptr)
+    }
+
+    public width(): int {
+        this.__checkOpen()
+        return this._pl._widthOf(this._ptr)
+    }
+
+    public shape(): []int {
+        return [this.height(), this.width()]
+    }
+
+    public columns(): []string {
+        this.__checkOpen()
+        const csv: string = this._pl._columnsCsv(this._ptr)
+        return Polars._splitCsv(csv)
+    }
+
+    public dtypes(): []string {
+        this.__checkOpen()
+        const csv: string = this._pl._dtypesCsv(this._ptr)
+        return Polars._splitCsv(csv)
+    }
+
+    /*
+     Per-column null counts. Returns aligned arrays — `columns()[i]` has
+     `nullCounts()[i]` nulls.
+     */
+    public nullCounts(): []int {
+        this.__checkOpen()
+        const csv: string = this._pl._nullCountsCsv(this._ptr)
+        const out: []int = []
+        const parts: []string = Polars._splitCsv(csv)
+        var i: int = 0
+        while (i < parts.length) {
+            const pair: string = parts[i]
+            const idx: int = pair.indexOf(":")
+            if (idx >= 0) {
+                out.push(int(pair.substring(idx + 1)))
+            } else {
+                out.push(0)
+            }
+            i = i + 1
+        }
+        return out
+    }
+
+    // ── Selection ──────────────────────────────────────────────────
+
+    public head(n: int): DataFrame {
+        return this.__wrap(this._pl._headOf(this._ptr, n), "pl_head")
+    }
+
+    public tail(n: int): DataFrame {
+        return this.__wrap(this._pl._tailOf(this._ptr, n), "pl_tail")
+    }
+
+    public slice(offset: int, length: int): DataFrame {
+        return this.__wrap(this._pl._sliceOf(this._ptr, offset, length), "pl_slice")
+    }
+
+    /*
+     Random row sample. Pass seed < 0 for a non-deterministic seed.
+     */
+    public sampleN(n: int, seed: int): DataFrame {
+        return this.__wrap(this._pl._sampleN(this._ptr, n, seed), "pl_sample_n")
+    }
+
+    /*
+     Drop duplicate rows.
+     @param subsetCsv - empty string to consider all columns, or "a,b,c"
+     @param keep - "first" | "last" | "any" | "none"
+     */
+    public unique(subsetCsv: string, keep: string): DataFrame {
+        return this.__wrap(this._pl._uniqueOf(this._ptr, subsetCsv, keep), "pl_unique")
+    }
+
+    public select(colsCsv: string): DataFrame {
+        return this.__wrap(this._pl._selectOf(this._ptr, colsCsv), "pl_select")
+    }
+
+    public drop(colsCsv: string): DataFrame {
+        return this.__wrap(this._pl._dropOf(this._ptr, colsCsv), "pl_drop")
+    }
+
+    /*
+     Rename columns. `pairsCsv` is "old1=new1,old2=new2".
+     */
+    public rename(pairsCsv: string): DataFrame {
+        return this.__wrap(this._pl._renameOf(this._ptr, pairsCsv), "pl_rename")
+    }
+
+    // ── Sort ───────────────────────────────────────────────────────
+
+    /*
+     Sort by one or more columns.
+     @param colsCsv - "a,b,c"
+     @param descCsv - empty for all-ascending, or "1,0,1" (1=desc).
+     */
+    public sortBy(colsCsv: string, descCsv: string): DataFrame {
+        return this.__wrap(this._pl._sortBy(this._ptr, colsCsv, descCsv), "pl_sort_by")
+    }
+
+    // ── Filter ─────────────────────────────────────────────────────
+
+    /*
+     Row filter on a single column.
+     @param op - "eq"|"=="|"ne"|"!="|"gt"|">"|"lt"|"<"|"gte"|">="|"lte"|"<="
+     @param value - parsed as bool, int64, float64, or string (in that order).
+     */
+    public filter(col: string, op: string, value: string): DataFrame {
+        return this.__wrap(this._pl._filterOf(this._ptr, col, op, value), "pl_filter")
+    }
+
+    public filterIsNull(col: string): DataFrame {
+        return this.__wrap(this._pl._filterIsNull(this._ptr, col), "pl_filter_is_null")
+    }
+
+    public filterNotNull(col: string): DataFrame {
+        return this.__wrap(this._pl._filterNotNull(this._ptr, col), "pl_filter_not_null")
+    }
+
+    // ── Null handling ──────────────────────────────────────────────
+
+    public dropNulls(): DataFrame {
+        return this.__wrap(this._pl._dropNulls(this._ptr), "pl_drop_nulls")
+    }
+
+    public dropNullsIn(colsCsv: string): DataFrame {
+        return this.__wrap(this._pl._dropNullsIn(this._ptr, colsCsv), "pl_drop_nulls_in")
+    }
+
+    // ── GroupBy ────────────────────────────────────────────────────
+
+    /*
+     Group rows by one or more columns and apply column:op aggregations.
+     Output is sorted by the group keys; aggregated columns are named
+     "<col>_<op>" (e.g. amount:sum -> column "amount_sum").
+     
+     @param byCsv    - "category,region"
+     @param aggSpecs - "amount:sum,amount:mean,id:count"
+     */
+    public groupBy(byCsv: string, aggSpecs: string): DataFrame {
+        return this.__wrap(this._pl._groupByAgg(this._ptr, byCsv, aggSpecs), "pl_group_by_agg")
+    }
+
+    /*
+     Backward-compatible single-column sum aggregation:
+     `df.groupbyAgg("category", "amount")` is equivalent to
+     `df.groupBy("category", "amount:sum")` but the output column is
+     named `amount_sum`.
+     */
+    public groupbyAgg(by: string, agg: string): DataFrame {
+        return this.groupBy(by, agg + ":sum")
+    }
+
+    // ── Joins / Concat ─────────────────────────────────────────────
+
+    /*
+     Join two DataFrames on one or more key columns.
+     @param other     - right-hand DataFrame
+     @param leftCsv   - "lkey1,lkey2"
+     @param rightCsv  - "rkey1,rkey2"
+     @param how       - "inner" | "left" | "outer" (or "full") | "cross" | "semi" | "anti"
+     */
+    public join(other: DataFrame, leftCsv: string, rightCsv: string, how: string): DataFrame {
+        this.__checkOpen()
+        other.__checkOpen()
+        return this.__wrap(
+            this._pl._joinOf(this._ptr, other._ptr, leftCsv, rightCsv, how),
+            "pl_join"
+        )
+    }
+
+    /*
+     Vertically stack `other` below this DataFrame. Schemas must match.
+     */
+    public vstack(other: DataFrame): DataFrame {
+        this.__checkOpen()
+        other.__checkOpen()
+        return this.__wrap(this._pl._vstackOf(this._ptr, other._ptr), "pl_vstack")
+    }
+
+    // ── Column scalars ─────────────────────────────────────────────
+
+    /*
+     Returns the sum of numeric column `col`. Throws if the column is all
+     null or non-numeric. NaN is returned only if the underlying data
+     contains NaN.
+     */
+    public colSum(col: string): float {
+        this.__checkOpen()
+        return this._pl._colScalar(this._ptr, col, this._pl._col_sum, "pl_col_sum_f64")
+    }
+
+    public colMean(col: string): float {
+        this.__checkOpen()
+        return this._pl._colScalar(this._ptr, col, this._pl._col_mean, "pl_col_mean_f64")
+    }
+
+    public colMin(col: string): float {
+        this.__checkOpen()
+        return this._pl._colScalar(this._ptr, col, this._pl._col_min, "pl_col_min_f64")
+    }
+
+    public colMax(col: string): float {
+        this.__checkOpen()
+        return this._pl._colScalar(this._ptr, col, this._pl._col_max, "pl_col_max_f64")
+    }
+
+    /*
+     Non-null count for `col`.
+     */
+    public colCount(col: string): int {
+        this.__checkOpen()
+        return this._pl._colCount(this._ptr, col)
+    }
+
+    /*
+     Read a single cell as a string. Returns empty string for null cells.
+     Throws if (col, row) is out of range.
+     */
+    public get(col: string, row: int): string {
+        this.__checkOpen()
+        return this._pl._getStr(this._ptr, col, row)
+    }
+
+    /*
+     Read an entire column as a `[]string` in a single FFI crossing.
+     Null cells become empty strings. Roughly 1000× faster than calling
+     `get(col, row)` in a loop because it eliminates per-cell C-FFI cost
+     and per-cell `CString` allocation in the Rust shim.
+     */
+    public column(col: string): []string {
+        this.__checkOpen()
+        return this._pl._columnStr(this._ptr, col)
+    }
+
+    /*
+     Lazy Series handle over `col`. The handle is cheap to construct —
+     it does NOT cross FFI until a materializer is called. Prefer this
+     over `column(col)` for numeric code that may chain or fan out into
+     multiple materializers; the Series carries the @iterationCost
+     decorator that nudges callers toward bulk paths.
+     
+     const s: Series = df.series("amount")
+     const f: []float = s.toFloats()        // one FFI call
+     const t: []string = s.toStrings()      // one FFI call
+     */
+    public series(col: string): Series {
+        this.__checkOpen()
+        return new Series(this, col)
+    }
+
+    /*
+     Lazy Matrix handle over `cols`. Does NOT allocate the (rows × cols)
+     C buffer until `.toCBuf()` / `.toFloats()` / `.toRows()` is called.
+     Designed to feed ML shims directly:
+     
+     const m: Matrix = df.matrix(featureCols)
+     const fit: any = model.fit(m.toCBuf(), m.rows(), m.ncols(), y)
+     m.close()                              // frees the buffer
+     */
+    public matrix(cols: []string): PolarsMatrix {
+        this.__checkOpen()
+        return new PolarsMatrix(this, cols)
+    }
+
+    /*
+     Bulk lexicographically-sorted categorical encoding done inside the
+     Rust shim. Returns a 2-element heterogeneous tuple:
+     [0] codes      — `[]int`, one code per row (null -> -1)
+     [1] categories — `[]string`, sorted ascending
+     This is the workhorse for the `dataFrameToCategorical` fast path —
+     it pushes the entire hash-build + sort + encode loop into native
+     polars code, skipping ~200 ms/1 M-rows of Chuks-level work.
+     */
+    public categorical(col: string): []any {
+        this.__checkOpen()
+        return this._pl._columnCategorical(this._ptr, col, this.height())
+    }
+
+    // ── I/O ────────────────────────────────────────────────────────
+
+    public writeCsv(path: string): void {
+        this.__checkOpen()
+        const rc: int = this._pl._writeCsv(this._ptr, path)
+        if (rc != 0) {
+            throw new Error("chuks_polars: pl_write_csv failed for " + path)
+        }
+    }
+
+    public writeParquet(path: string): void {
+        this.__checkOpen()
+        const rc: int = this._pl._writeParquet(this._ptr, path)
+        if (rc != 0) {
+            throw new Error("chuks_polars: pl_write_parquet failed for " + path)
+        }
+    }
+
+    // ── Render / lifecycle ─────────────────────────────────────────
+
+    public toString(): string {
+        this.__checkOpen()
+        return this._pl._callToString(this._ptr)
+    }
+
+    /*
+     Print the DataFrame to stdout using Polars' built-in ASCII table.
+     Pass `n` to limit rows (<= 0 prints the full frame).
+     */
+    public show(n: int): void {
+        this.__checkOpen()
+        if (n <= 0 || n >= this.height()) {
+            println(this.toString())
+            return
+        }
+        const h: DataFrame = this.head(n)
+        println(h.toString())
+        h.close()
+    }
+
+    /*
+     Emit a rich-display MIME bundle for this DataFrame. When running inside
+     the Chuks Jupyter kernel the bundle is captured from stdout and rendered
+     as an inline HTML table; outside the kernel the marker line is harmless
+     but ugly, so plain scripts should keep using `show()` / `toString()`.
+     
+     `maxRows` caps how many rows are serialized into HTML (default ~50 to
+     stay snappy on huge frames).
+     */
+    public display(maxRows: int): void {
+        this.__checkOpen()
+        var rows: int = maxRows
+        if (rows <= 0) {
+            rows = 50
+        }
+        if (rows > this.height()) {
+            rows = this.height()
+        }
+        const htmlBody: string = this.toHtml(rows)
+        const text: string = this.toString()
+        const bundle: string = "{\"text/html\":\"" + DataFrame._jsonEscape(htmlBody) + "\",\"text/plain\":\"" + DataFrame._jsonEscape(text) + "\"}"
+        println("\u001d__CHUKS_MIME__" + bundle)
+    }
+
+    /*
+     Render the frame as an HTML <table>. `maxRows <= 0` means all rows
+     (use carefully on big frames — every cell crosses FFI). Returns the
+     HTML string; pair with `fs.writeFile` to dump to disk.
+     */
+    public toHtml(maxRows: int): string {
+        this.__checkOpen()
+        const cols: []string = this.columns()
+        const total: int = this.height()
+        var rows: int = total
+        if (maxRows > 0 && maxRows < rows) {
+            rows = maxRows
+        }
+
+        var html: string = "<table class=\"chuks-polars\" style=\"border-collapse:collapse;font-family:ui-monospace,monospace;font-size:13px\">"
+        html = html + "<thead><tr>"
+        var i: int = 0
+        while (i < cols.length) {
+            html = html + "<th style=\"border:1px solid #ddd;padding:4px 8px;background:#f6f8fa;text-align:left\">" + DataFrame._htmlEscape(cols[i]) + "</th>"
+            i = i + 1
+        }
+        html = html + "</tr></thead><tbody>"
+
+        var ri: int = 0
+        while (ri < rows) {
+            html = html + "<tr>"
+            var ci: int = 0
+            while (ci < cols.length) {
+                const cell: string = this._pl._getStr(this._ptr, cols[ci], ri)
+                html = html + "<td style=\"border:1px solid #ddd;padding:4px 8px\">" + DataFrame._htmlEscape(cell) + "</td>"
+                ci = ci + 1
+            }
+            html = html + "</tr>"
+            ri = ri + 1
+        }
+        html = html + "</tbody></table>"
+        if (rows < total) {
+            html = html + "<div style=\"font:12px ui-monospace,monospace;color:#666;margin-top:4px\">showing " + string(rows) + " of " + string(total) + " rows · " + string(cols.length) + " cols</div>"
+        }
+        return html
+    }
+
+    /*
+     Render the frame as a GitHub-flavored Markdown table.
+     */
+    public toMarkdown(maxRows: int): string {
+        this.__checkOpen()
+        const cols: []string = this.columns()
+        const total: int = this.height()
+        var rows: int = total
+        if (maxRows > 0 && maxRows < rows) {
+            rows = maxRows
+        }
+
+        var out: string = "| " + cols.join(" | ") + " |\n|"
+        var i: int = 0
+        while (i < cols.length) {
+            out = out + " --- |"
+            i = i + 1
+        }
+        out = out + "\n"
+
+        var ri: int = 0
+        while (ri < rows) {
+            out = out + "|"
+            var ci: int = 0
+            while (ci < cols.length) {
+                const cell: string = this._pl._getStr(this._ptr, cols[ci], ri)
+                out = out + " " + DataFrame._mdEscape(cell) + " |"
+                ci = ci + 1
+            }
+            out = out + "\n"
+            ri = ri + 1
+        }
+        if (rows < total) {
+            out = out + "\n_showing " + string(rows) + " of " + string(total) + " rows_\n"
+        }
+        return out
+    }
+
+    /*
+     Write a self-contained HTML page containing a Chart.js bar chart.
+     `labelCol` supplies category labels (x-axis), `valueCol` supplies
+     numeric heights. Returns the absolute path written. Uses Chart.js
+     from a CDN (`cdn.jsdelivr.net`).
+     */
+    public plotBar(labelCol: string, valueCol: string, title: string, outPath: string): string {
+        return this.__writeChart("bar", labelCol, valueCol, title, outPath)
+    }
+
+    /*
+     Write a Chart.js line chart. `xCol` supplies x-axis labels (treated
+     as categorical), `yCol` supplies the numeric series.
+     */
+    public plotLine(xCol: string, yCol: string, title: string, outPath: string): string {
+        return this.__writeChart("line", xCol, yCol, title, outPath)
+    }
+
+    /*
+     Write a Chart.js pie chart. `labelCol` slices, `valueCol` weights.
+     */
+    public plotPie(labelCol: string, valueCol: string, title: string, outPath: string): string {
+        return this.__writeChart("pie", labelCol, valueCol, title, outPath)
+    }
+
+    /*
+     Write a Chart.js histogram of a single numeric column, binned into
+     `bins` equal-width buckets between the column's min and max.
+     */
+    public plotHistogram(col: string, bins: int, title: string, outPath: string): string {
+        this.__checkOpen()
+        if (bins <= 0) {
+            throw new Error("chuks_polars: plotHistogram bins must be > 0")
+        }
+        const lo: float = this.colMin(col)
+        const hi: float = this.colMax(col)
+        const span: float = hi - lo
+        if (span <= 0.0) {
+            throw new Error("chuks_polars: plotHistogram: column has no variance (min == max)")
+        }
+        const width: float = span / float(bins)
+
+        const counts: []int = []
+        const labels: []string = []
+        var b: int = 0
+        while (b < bins) {
+            counts.push(0)
+            const edge: float = lo + width * float(b)
+            labels.push(DataFrame._fmtFloat(edge))
+            b = b + 1
+        }
+
+        const n: int = this.height()
+        var i: int = 0
+        while (i < n) {
+            const raw: string = this._pl._getStr(this._ptr, col, i)
+            if (raw.length > 0) {
+                const v: float = float(raw)
+                var idx: int = int((v - lo) / width)
+                if (idx < 0) {
+                    idx = 0
+                }
+                if (idx >= bins) {
+                    idx = bins - 1
+                }
+                counts[idx] = counts[idx] + 1
+            }
+            i = i + 1
+        }
+
+        const labelsJs: string = DataFrame._jsStringArray(labels)
+        const dataJs: string = DataFrame._jsIntArray(counts)
+        const html: string = DataFrame._chartHtml("bar", title, col, labelsJs, dataJs)
+        if (!fs.writeFile(outPath, html)) {
+            throw new Error("chuks_polars: plotHistogram failed to write " + outPath)
+        }
+        return outPath
+    }
+
+    private __writeChart(
+        kind: string,
+        labelCol: string,
+        valueCol: string,
+        title: string,
+        outPath: string
+    ): string {
+        this.__checkOpen()
+        const n: int = this.height()
+        const labels: []string = []
+        const values: []float = []
+        var i: int = 0
+        while (i < n) {
+            labels.push(this._pl._getStr(this._ptr, labelCol, i))
+            const raw: string = this._pl._getStr(this._ptr, valueCol, i)
+            if (raw.length == 0) {
+                values.push(0.0)
+            } else {
+                values.push(float(raw))
+            }
+            i = i + 1
+        }
+        const labelsJs: string = DataFrame._jsStringArray(labels)
+        const dataJs: string = DataFrame._jsFloatArray(values)
+        const html: string = DataFrame._chartHtml(kind, title, valueCol, labelsJs, dataJs)
+        if (!fs.writeFile(outPath, html)) {
+            throw new Error("chuks_polars: plot failed to write " + outPath)
+        }
+        return outPath
+    }
+
+    private static _htmlEscape(s: string): string {
+        var out: string = s.replace("&", "&amp;")
+        out = out.replace("<", "&lt;")
+        out = out.replace(">", "&gt;")
+        out = out.replace("\"", "&quot;")
+        return out
+    }
+
+    private static _mdEscape(s: string): string {
+        var out: string = s.replace("|", "\\|")
+        out = out.replace("\n", " ")
+        return out
+    }
+
+    private static _jsEscape(s: string): string {
+        var out: string = s.replace("\\", "\\\\")
+        out = out.replace("\"", "\\\"")
+        out = out.replace("\n", "\\n")
+        out = out.replace("\r", "\\r")
+        return out
+    }
+
+    /*
+     Escape a string for safe inclusion as a JSON string literal value.
+     */
+    private static _jsonEscape(s: string): string {
+        var out: string = s.replaceAll("\\", "\\\\")
+        out = out.replaceAll("\"", "\\\"")
+        out = out.replaceAll("\n", "\\n")
+        out = out.replaceAll("\r", "\\r")
+        out = out.replaceAll("\t", "\\t")
+        return out
+    }
+
+    private static _jsStringArray(items: []string): string {
+        var out: string = "["
+            var i: int = 0
+            while (i < items.length) {
+                if (i > 0) {
+                    out = out + ","
+                }
+                out = out + "\"" + DataFrame._jsEscape(items[i]) + "\""
+                i = i + 1
+            }
+            return out + "]"
+    }
+
+    private static _jsFloatArray(items: []float): string {
+        var out: string = "["
+            var i: int = 0
+            while (i < items.length) {
+                if (i > 0) {
+                    out = out + ","
+                }
+                out = out + string(items[i])
+                i = i + 1
+            }
+            return out + "]"
+    }
+
+    private static _jsIntArray(items: []int): string {
+        var out: string = "["
+            var i: int = 0
+            while (i < items.length) {
+                if (i > 0) {
+                    out = out + ","
+                }
+                out = out + string(items[i])
+                i = i + 1
+            }
+            return out + "]"
+    }
+
+    private static _fmtFloat(v: float): string {
+        return string(v)
+    }
+
+    private static _chartHtml(
+        kind: string,
+        title: string,
+        seriesLabel: string,
+        labelsJs: string,
+        dataJs: string
+    ): string {
+        const palette: string = "['#4f8bff','#ff7f50','#7ed957','#ffd166','#a06cd5','#26a69a','#ef476f','#118ab2','#ff9f1c','#83c5be']"
+        const useDistinct: bool = kind == "pie"
+        const bgExpr: string = useDistinct ? palette : "'rgba(79,139,255,0.6)'"
+        const borderExpr: string = useDistinct ? palette : "'#4f8bff'"
+        const titleEsc: string = DataFrame._jsEscape(title)
+        const seriesEsc: string = DataFrame._jsEscape(seriesLabel)
+
+        var out: string = "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>"
+        out = out + DataFrame._htmlEscape(title)
+        out = out + "</title>\n<script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js\"></script>\n"
+        out = out + "<style>body{font-family:system-ui,sans-serif;margin:24px;background:#fafafa}h1{font-size:18px;color:#333}#wrap{max-width:960px;margin:0 auto;background:#fff;padding:24px;border-radius:8px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}</style>\n"
+        out = out + "</head><body><div id=\"wrap\"><h1>"
+        out = out + DataFrame._htmlEscape(title)
+        out = out + "</h1><canvas id=\"c\"></canvas></div>\n<script>\n"
+        out = out + "const labels = " + labelsJs + ";\n"
+        out = out + "const data = " + dataJs + ";\n"
+        out = out + "new Chart(document.getElementById('c'), {type:'" + kind + "',data:{labels:labels,datasets:[{label:\"" + seriesEsc + "\",data:data,backgroundColor:" + bgExpr + ",borderColor:" + borderExpr + ",borderWidth:1,tension:0.2}]},options:{responsive:true,plugins:{title:{display:true,text:\"" + titleEsc + "\"},legend:{display:" + (useDistinct ? "true" : "false") + "}}}});\n"
+        out = out + "</script></body></html>\n"
+        return out
+    }
+
+    public close(): void {
+        if (this._closed) {
+            return
+        }
+        this._closed = true
+        this._pl._freeDf(this._ptr)
+    }
+
+    // ── Internal helpers ───────────────────────────────────────────
+
+    private __checkOpen(): void {
+        if (this._closed) {
+            throw new Error("chuks_polars: DataFrame is closed")
+        }
+    }
+
+    private __wrap(ptr: CPtr, label: string): DataFrame {
+        if (ptr.isNull()) {
+            throw new Error("chuks_polars: " + label + " failed")
+        }
+        return new DataFrame(ptr, this._pl)
+    }
+}
+
+// ── Series handle (lazy column view) ─────────────────────────────────
+
+/*
+ A lazy, single-column handle (or computed-column expression). Series
+ carries an in-memory expression *plan* — fluent operators
+ (`.eq(2.0)`, `.add(1)`, `.cast("f64")`, ...) just wrap the plan with
+ another node. The plan does NOT cross FFI until a materializer
+ (`.toFloats()`, `.toInts()`, `.toStrings()`) is called, at which point
+ the entire chain is executed inside the Rust shim in a single FFI
+ crossing.
+ 
+ // 3 fluent ops → ONE FFI call → []float of 1.0 / 0.0
+ const yF: []float = df.series("target").eq(2.0).toFloats()
+ 
+ // Composable: chain boolean / arithmetic / fillNull / cast freely.
+ const norm: []float = df.series("amount")
+ .fillNull(0.0)
+ .sub(mean).div(std)
+ .toFloats()
+ 
+ Operators currently supported:
+ compare → eq, ne, gt, lt, ge, le        (right-hand: float scalar)
+ arith   → add, sub, mul, div            (right-hand: float scalar)
+ logical → and, or, not                   (other: Series)
+ cast    → cast("f64" | "i64" | "bool")
+ null    → fillNull(value), isNull(), isNotNull()
+ 
+ The class is decorated with `@iterationCost` so attempting
+ `for (var v of series) { ... }` raises a typechecker warning steering
+ callers to the bulk path. Materialize first, iterate the slice second.
+ */
+@iterationCost("warning", "Iterating a Series row-by-row in Chuks is ~200x slower than columnar materialization. Materialize first.", "series.toFloats()", "series.toStrings()", "series.toInts()")
+export class Series {
+    var _df: DataFrame
+    var _col: string          // raw column name (empty for chained / computed series)
+    var _plan: string         // cached JSON plan; built lazily for raw col
+    var _isLazy: bool         // true once any fluent op has wrapped the plan
+
+    constructor(df: DataFrame, col: string) {
+        this._df = df
+        this._col = col
+        this._plan = ""
+        this._isLazy = false
+    }
+
+    public name(): string {
+        return this._col
+    }
+
+    public length(): int {
+        return this._df.height()
+    }
+
+    // ── Internal: build / wrap plan JSON ──────────────────────────
+
+    /*
+     Return the JSON plan for this series. For a raw column the plan
+     is built on demand and cached. For a chained series the plan is
+     already set.
+     */
+    private _getPlan(): string {
+        if (this._plan == "") {
+            this._plan = "{\"op\":\"col\",\"name\":\"" + Series._jsonEsc(this._col) + "\"}"
+        }
+        return this._plan
+    }
+
+    /*
+     Wrap this series' plan in a new node, returning a new chained
+     Series. The returned Series is marked lazy so materializers go
+     through the executor path.
+     */
+    private _wrap(plan: string): Series {
+        const s: Series = new Series(this._df, "")
+        s._plan = plan
+        s._isLazy = true
+        return s
+    }
+
+    private static _jsonEsc(s: string): string {
+        // Minimal JSON string escape — handle backslash and double quote.
+        // Polars column names are virtually never going to contain control
+        // characters, but escape both backslash and quote defensively.
+        const out: []string = []
+        var i: int = 0
+        while (i < s.length) {
+            const c2: string = s.substring(i, i + 1)
+            if (c2 == "\\") { out.push("\\\\") }
+            else if (c2 == "\"") { out.push("\\\"") }
+            else { out.push(c2) }
+            i = i + 1
+        }
+        return out.join("")
+    }
+
+    private static _fmtF(v: float): string {
+        // Plain decimal representation — JSON-safe for ordinary finite f64.
+        return string(v)
+    }
+
+    // ── Fluent operators: comparisons (right-hand = scalar) ───────
+
+    public eq(v: float): Series { return this._binopScalar("eq", v) }
+    public ne(v: float): Series { return this._binopScalar("ne", v) }
+    public gt(v: float): Series { return this._binopScalar("gt", v) }
+    public lt(v: float): Series { return this._binopScalar("lt", v) }
+    public ge(v: float): Series { return this._binopScalar("ge", v) }
+    public le(v: float): Series { return this._binopScalar("le", v) }
+
+    // ── Fluent operators: arithmetic (right-hand = scalar) ────────
+
+    public add(v: float): Series { return this._binopScalar("add", v) }
+    public sub(v: float): Series { return this._binopScalar("sub", v) }
+    public mul(v: float): Series { return this._binopScalar("mul", v) }
+    public div(v: float): Series { return this._binopScalar("div", v) }
+
+    // ── Fluent operators: logical (other = Series) ────────────────
+
+    public and_(other: Series): Series { return this._binopSeries("and", other) }
+    public or_(other: Series): Series  { return this._binopSeries("or", other) }
+
+    public not_(): Series {
+        return this._wrap("{\"op\":\"not\",\"arg\":" + this._getPlan() + "}")
+    }
+
+    // ── Cast / null handling ──────────────────────────────────────
+
+    /*
+     Cast the underlying series to a new dtype.
+     dtype ∈ "f64" | "i64" | "bool". Most users won't need this —
+     `.toFloats()` / `.toInts()` already cast on the way out.
+     */
+    public cast(dtype: string): Series {
+        return this._wrap(
+            "{\"op\":\"cast\",\"dtype\":\"" + dtype + "\",\"arg\":" + this._getPlan() + "}"
+        )
+    }
+
+    public fillNull(value: float): Series {
+        return this._wrap(
+            "{\"op\":\"fillnull\",\"v\":" + Series._fmtF(value) +
+                ",\"arg\":" + this._getPlan() + "}"
+        )
+    }
+
+    public isNull(): Series {
+        return this._wrap("{\"op\":\"isnull\",\"arg\":" + this._getPlan() + "}")
+    }
+
+    public isNotNull(): Series {
+        return this._wrap("{\"op\":\"isnotnull\",\"arg\":" + this._getPlan() + "}")
+    }
+
+    // ── Internal: binop builders ──────────────────────────────────
+
+    private _binopScalar(name: string, v: float): Series {
+        const rhs: string = "{\"op\":\"lit\",\"t\":\"f64\",\"v\":" + Series._fmtF(v) + "}"
+        const plan: string = "{\"op\":\"binop\",\"name\":\"" + name +
+            "\",\"l\":" + this._getPlan() +
+            ",\"r\":" + rhs + "}"
+        return this._wrap(plan)
+    }
+
+    private _binopSeries(name: string, other: Series): Series {
+        const plan: string = "{\"op\":\"binop\",\"name\":\"" + name +
+            "\",\"l\":" + this._getPlan() +
+            ",\"r\":" + other._getPlan() + "}"
+        return this._wrap(plan)
+    }
+
+    // ── Materializers (bulk FFI) ──────────────────────────────────
+
+    /*
+     Materialize as `[]string` (null cells become empty strings).
+     Only supported on raw column series for now — chained / computed
+     series should `.cast("f64").toFloats()` then format manually.
+     */
+    public toStrings(): []string {
+        if (this._isLazy) {
+            throw new Error("chuks_polars: Series.toStrings() requires a raw column (use .toFloats() / .toInts() for chained series)")
+        }
+        return this._df._pl._columnStr(this._df._ptr, this._col)
+    }
+
+    /*
+     Materialize as `[]float`. Values are cast to f64 inside the Rust
+     shim (int64 / float32 / bool work). Nulls become NaN. For a raw
+     column this calls `pl_col_f64` directly (zero plan parsing). For
+     a chained series this executes the full plan in one FFI crossing.
+     */
+    public toFloats(): []float {
+        if (!this._isLazy) {
+            return this._df._pl._columnF64(this._df._ptr, this._col, this._df.height())
+        }
+        return this._df._pl._seriesExecF64(this._df._ptr, this._getPlan(), this._df.height())
+    }
+
+    /*
+     Materialize as `[]int`. Convenience wrapper around `toFloats()` —
+     each cell is truncated to int. NaN cells become 0.
+     */
+    public toInts(): []int {
+        const f: []float = this.toFloats()
+        const out: []int = []int{}
+        var i: int = 0
+        while (i < f.length) {
+            const v: float = f[i]
+            // NaN check: v != v is only true for NaN
+            if (v != v) {
+                out.push(0)
+            } else {
+                out.push(int(v))
+            }
+            i = i + 1
+        }
+        return out
+    }
+}
+
+// ── Matrix handle (lazy multi-column view) ──────────────────────────
+
+/*
+ A lazy, multi-column row-major handle. Construction is free —
+ Matrix does NOT allocate the `(rows × ncols) * 8` byte C buffer until
+ a materializer is called. The buffer is cached on first materialize
+ and reused by subsequent calls.
+ 
+ Lifecycle: call `.close()` (or `.toCBuf().free()` if you absorbed the
+ pointer yourself) to release the C buffer. `close()` is idempotent.
+ 
+ Designed to feed ML shims directly:
+ 
+ const m: Matrix = df.matrix(featureCols)
+ const fit = model.fit(m.toCBuf(), m.rows(), m.ncols(), y)
+ m.close()
+ */
+@iterationCost("warning", "Iterating a Matrix row-by-row in Chuks is slow. Use .toCBuf() to feed ML APIs, or .toRows() / .toFloats() for an explicit materialization.", "matrix.toCBuf()  // for ML shims", "matrix.toRows()  // [][]float", "matrix.toFloats() // flat row-major []float")
+export class PolarsMatrix extends Matrix {
+    var _df: DataFrame
+    var _cols: []string
+    var _materialized: bool
+
+    constructor(df: DataFrame, cols: []string) {
+        super(new CPtr(0, false, -1), df.height(), cols.length, false)
+        this._df = df
+        this._cols = cols
+        this._materialized = false
+    }
+
+    public columns(): []string {
+        return this._cols
+    }
+
+    /*
+     Materialize (or return cached) flat row-major C buffer. Buffer
+     ownership stays with the PolarsMatrix — do not `.free()` it
+     directly; call `matrix.close()` instead.
+     */
+    public override toCBuf(): CPtr {
+        if (this._closed) {
+            throw new Error("chuks_polars: PolarsMatrix is closed")
+        }
+        if (!this._materialized) {
+            this._buf = this._df._pl._matrixF64Buf(this._df._ptr, this._cols, this._rows)
+            this._materialized = true
+        }
+        return this._buf
+    }
+
+    /*
+     Materialize as flat row-major `[]float`. Copies out of the C
+     buffer; the buffer itself stays cached on the PolarsMatrix.
+     */
+    public toFloats(): []float {
+        const buf: CPtr = this.toCBuf()
+        return c.readDoubleSlice(buf, this._rows * this._ncols)
+    }
+
+    /*
+     Materialize as `[][]float` (a row per outer slot). Useful for
+     small matrices or APIs that still want boxed rows. For ML, prefer
+     `.toCBuf()` — it skips the per-row allocation.
+     */
+    public toRows(): [][]float {
+        const flat: []float = this.toFloats()
+        const out: [][]float = [][]float{}
+        var i: int = 0
+        while (i < this._rows) {
+            const row: []float = []float{}
+            var j: int = 0
+            while (j < this._ncols) {
+                row.push(flat[i * this._ncols + j])
+                j = j + 1
+            }
+            out.push(row)
+            i = i + 1
+        }
+        return out
+    }
+
+    /*
+     Release the underlying C buffer. Safe to call multiple times.
+     */
+    public override close(): void {
+        if (this._closed) {
+            return
+        }
+        this._closed = true
+        if (this._materialized && !this._buf.isNull()) {
+            this._buf.free()
+        }
+    }
+}
+
+// ── Polars facade ───────────────────────────────────────────────────
+
+export class Polars {
+    var _lib: LibHandle
+
+    // I/O
+    var _read_csv: CFunc
+    var _read_csv_opts: CFunc
+    var _read_parquet: CFunc
+    var _write_csv: CFunc
+    var _write_parquet: CFunc
+
+    // Inspection
+    var _height: CFunc
+    var _width: CFunc
+    var _columns_csv: CFunc
+    var _dtypes_csv: CFunc
+    var _null_counts_csv: CFunc
+
+    // Selection
+    var _select: CFunc
+    var _drop: CFunc
+    var _rename: CFunc
+    var _head: CFunc
+    var _tail: CFunc
+    var _slice: CFunc
+    var _sample_n: CFunc
+    var _unique: CFunc
+
+    // Sort / filter / nulls
+    var _sort_by: CFunc
+    var _filter: CFunc
+    var _filter_is_null: CFunc
+    var _filter_not_null: CFunc
+    var _drop_nulls: CFunc
+    var _drop_nulls_in: CFunc
+
+    // Group / join / concat
+    var _group_by_agg: CFunc
+    var _join: CFunc
+    var _vstack: CFunc
+
+    // Scalars
+    var _col_sum: CFunc
+    var _col_mean: CFunc
+    var _col_min: CFunc
+    var _col_max: CFunc
+    var _col_count: CFunc
+
+    // Row access
+    var _get_str: CFunc
+    var _col_str: CFunc
+    var _col_categorical: CFunc
+    var _col_f64: CFunc
+    var _matrix_f64: CFunc
+    var _series_exec_f64: CFunc
+
+    // Render / lifecycle
+    var _to_string: CFunc
+    var _free_df: CFunc
+    var _free_string: CFunc
+
+    /*
+     Build (or reuse cached) the shim cdylib at `shimManifestDir` and load it.
+     
+     When called with no argument, defaults to the package's install
+     directory (`chuks_packages/@chuks/polars`), where the registry-shipped
+     prebuilt (`.prebuilt/<os>-<arch>/lib*.{dylib|so|dll}`) is auto-discovered
+     by `r.cargoBuild`. Pass an explicit absolute path only when developing
+     the shim locally.
+     */
+    constructor(shimManifestDir: string = "chuks_packages/@chuks/polars") {
+        const libPath: string = r.cargoBuild(shimManifestDir, true)
+        this._lib = c.load(libPath)
+        const L: LibHandle = this._lib
+
+        // I/O
+        this._read_csv = L.symbol("pl_read_csv", new CSig([CSig.T_CSTRING], CSig.T_PTR))
+        this._read_csv_opts = L.symbol(
+            "pl_read_csv_opts",
+            new CSig([CSig.T_CSTRING, CSig.T_INT, CSig.T_INT, CSig.T_INT, CSig.T_INT], CSig.T_PTR)
+        )
+        this._read_parquet = L.symbol("pl_read_parquet", new CSig([CSig.T_CSTRING], CSig.T_PTR))
+        this._write_csv = L.symbol("pl_write_csv", new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_INT))
+        this._write_parquet = L.symbol(
+            "pl_write_parquet",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_INT)
+        )
+
+        // Inspection
+        this._height = L.symbol("pl_height", new CSig([CSig.T_PTR], CSig.T_INT64))
+        this._width = L.symbol("pl_width", new CSig([CSig.T_PTR], CSig.T_INT64))
+        this._columns_csv = L.symbol("pl_columns_csv", new CSig([CSig.T_PTR], CSig.T_PTR))
+        this._dtypes_csv = L.symbol("pl_dtypes_csv", new CSig([CSig.T_PTR], CSig.T_PTR))
+        this._null_counts_csv = L.symbol("pl_null_counts_csv", new CSig([CSig.T_PTR], CSig.T_PTR))
+
+        // Selection
+        this._select = L.symbol("pl_select", new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_PTR))
+        this._drop = L.symbol("pl_drop", new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_PTR))
+        this._rename = L.symbol("pl_rename", new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_PTR))
+        this._head = L.symbol("pl_head", new CSig([CSig.T_PTR, CSig.T_INT], CSig.T_PTR))
+        this._tail = L.symbol("pl_tail", new CSig([CSig.T_PTR, CSig.T_INT], CSig.T_PTR))
+        this._slice = L.symbol(
+            "pl_slice",
+            new CSig([CSig.T_PTR, CSig.T_INT64, CSig.T_INT64], CSig.T_PTR)
+        )
+        this._sample_n = L.symbol(
+            "pl_sample_n",
+            new CSig([CSig.T_PTR, CSig.T_INT64, CSig.T_INT64], CSig.T_PTR)
+        )
+        this._unique = L.symbol(
+            "pl_unique",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_PTR)
+        )
+
+        // Sort / filter / nulls
+        this._sort_by = L.symbol(
+            "pl_sort_by",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_PTR)
+        )
+        this._filter = L.symbol(
+            "pl_filter",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_PTR)
+        )
+        this._filter_is_null = L.symbol(
+            "pl_filter_is_null",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_PTR)
+        )
+        this._filter_not_null = L.symbol(
+            "pl_filter_not_null",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_PTR)
+        )
+        this._drop_nulls = L.symbol("pl_drop_nulls", new CSig([CSig.T_PTR], CSig.T_PTR))
+        this._drop_nulls_in = L.symbol(
+            "pl_drop_nulls_in",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_PTR)
+        )
+
+        // Group / join / concat
+        this._group_by_agg = L.symbol(
+            "pl_group_by_agg",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING, CSig.T_CSTRING], CSig.T_PTR)
+        )
+        this._join = L.symbol(
+            "pl_join",
+            new CSig(
+                [CSig.T_PTR, CSig.T_PTR, CSig.T_CSTRING, CSig.T_CSTRING, CSig.T_CSTRING],
+                CSig.T_PTR
+            )
+        )
+        this._vstack = L.symbol("pl_vstack", new CSig([CSig.T_PTR, CSig.T_PTR], CSig.T_PTR))
+
+        // Scalars — all out-param pattern: (*df, col, *f64) -> c_int
+        const scalarSig: CSig = new CSig(
+            [CSig.T_PTR, CSig.T_CSTRING, CSig.T_PTR],
+            CSig.T_INT
+        )
+        this._col_sum = L.symbol("pl_col_sum_f64", scalarSig)
+        this._col_mean = L.symbol("pl_col_mean_f64", scalarSig)
+        this._col_min = L.symbol("pl_col_min_f64", scalarSig)
+        this._col_max = L.symbol("pl_col_max_f64", scalarSig)
+        this._col_count = L.symbol(
+            "pl_col_count",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING], CSig.T_INT64)
+        )
+
+        // Row access
+        this._get_str = L.symbol(
+            "pl_get_str",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING, CSig.T_INT64], CSig.T_PTR)
+        )
+        this._col_str = L.symbol(
+            "pl_col_str",
+            new CSig([CSig.T_PTR, CSig.T_CSTRING, CSig.T_INT], CSig.T_PTR)
+        )
+        // (df, col_name, sep, codes_buf, codes_cap) -> joined-cats c-string
+        this._col_categorical = L.symbol(
+            "pl_col_categorical",
+            new CSig(
+                [CSig.T_PTR, CSig.T_CSTRING, CSig.T_INT, CSig.T_PTR, CSig.T_INT64],
+                CSig.T_PTR
+            )
+        )
+        // (df, col_name, out_buf, out_cap_bytes) -> n_written (or -1)
+        this._col_f64 = L.symbol(
+            "pl_col_f64",
+            new CSig(
+                [CSig.T_PTR, CSig.T_CSTRING, CSig.T_PTR, CSig.T_INT64],
+                CSig.T_INT64
+            )
+        )
+        // (df, cols_csv, out_buf, out_cap_bytes) -> n_elems_written (-1 on error)
+        this._matrix_f64 = L.symbol(
+            "pl_matrix_f64",
+            new CSig(
+                [CSig.T_PTR, CSig.T_CSTRING, CSig.T_PTR, CSig.T_INT64],
+                CSig.T_INT64
+            )
+        )
+        // (df, plan_json, out_buf, out_cap_bytes) -> n_written (-1 on error)
+        this._series_exec_f64 = L.symbol(
+            "pl_series_exec_f64",
+            new CSig(
+                [CSig.T_PTR, CSig.T_CSTRING, CSig.T_PTR, CSig.T_INT64],
+                CSig.T_INT64
+            )
+        )
+
+        // Render / lifecycle
+        this._to_string = L.symbol("pl_to_string", new CSig([CSig.T_PTR], CSig.T_PTR))
+        this._free_df = L.symbol("pl_free_df", new CSig([CSig.T_PTR], CSig.T_VOID))
+        this._free_string = L.symbol("pl_free_string", new CSig([CSig.T_PTR], CSig.T_VOID))
+    }
+
+    // ── Public entry points (reader / loaders) ─────────────────────
+
+    /*
+     Reads a CSV file (with header row) into a new DataFrame.
+     */
+    public readCsv(path: string): DataFrame {
+        const h: any = this._read_csv.call([path])
+        const ptr: CPtr = new CPtr(h, false, -1)
+        if (ptr.isNull()) {
+            throw new Error("chuks_polars: pl_read_csv failed for " + path)
+        }
+        return new DataFrame(ptr, this)
+    }
+
+    /*
+     Reads a CSV with custom options.
+     @param sep        - field separator byte (e.g. 44 for ',', 9 for tab, 0 = default ',')
+     @param hasHeader  - true if the first row is a header
+     @param skipRows   - rows to skip BEFORE the header
+     @param nRows      - read at most this many rows; -1 = all
+     */
+    public readCsvOpts(
+        path: string,
+        sep: int,
+        hasHeader: bool,
+        skipRows: int,
+        nRows: int
+    ): DataFrame {
+        const hh: int = hasHeader ? 1 : 0
+        const h: any = this._read_csv_opts.call([path, sep, hh, skipRows, nRows])
+        const ptr: CPtr = new CPtr(h, false, -1)
+        if (ptr.isNull()) {
+            throw new Error("chuks_polars: pl_read_csv_opts failed for " + path)
+        }
+        return new DataFrame(ptr, this)
+    }
+
+    public readParquet(path: string): DataFrame {
+        const h: any = this._read_parquet.call([path])
+        const ptr: CPtr = new CPtr(h, false, -1)
+        if (ptr.isNull()) {
+            throw new Error("chuks_polars: pl_read_parquet failed for " + path)
+        }
+        return new DataFrame(ptr, this)
+    }
+
+    // ── Internal — called from DataFrame ───────────────────────────
+
+    public _headOf(df: CPtr, n: int): CPtr {
+        return new CPtr(this._head.call([df.handle(), n]), false, -1)
+    }
+    public _tailOf(df: CPtr, n: int): CPtr {
+        return new CPtr(this._tail.call([df.handle(), n]), false, -1)
+    }
+    public _sliceOf(df: CPtr, offset: int, length: int): CPtr {
+        return new CPtr(this._slice.call([df.handle(), offset, length]), false, -1)
+    }
+    public _sampleN(df: CPtr, n: int, seed: int): CPtr {
+        return new CPtr(this._sample_n.call([df.handle(), n, seed]), false, -1)
+    }
+    public _uniqueOf(df: CPtr, subsetCsv: string, keep: string): CPtr {
+        return new CPtr(this._unique.call([df.handle(), subsetCsv, keep]), false, -1)
+    }
+    public _selectOf(df: CPtr, colsCsv: string): CPtr {
+        return new CPtr(this._select.call([df.handle(), colsCsv]), false, -1)
+    }
+    public _dropOf(df: CPtr, colsCsv: string): CPtr {
+        return new CPtr(this._drop.call([df.handle(), colsCsv]), false, -1)
+    }
+    public _renameOf(df: CPtr, pairsCsv: string): CPtr {
+        return new CPtr(this._rename.call([df.handle(), pairsCsv]), false, -1)
+    }
+    public _sortBy(df: CPtr, colsCsv: string, descCsv: string): CPtr {
+        return new CPtr(this._sort_by.call([df.handle(), colsCsv, descCsv]), false, -1)
+    }
+    public _filterOf(df: CPtr, col: string, op: string, value: string): CPtr {
+        return new CPtr(this._filter.call([df.handle(), col, op, value]), false, -1)
+    }
+    public _filterIsNull(df: CPtr, col: string): CPtr {
+        return new CPtr(this._filter_is_null.call([df.handle(), col]), false, -1)
+    }
+    public _filterNotNull(df: CPtr, col: string): CPtr {
+        return new CPtr(this._filter_not_null.call([df.handle(), col]), false, -1)
+    }
+    public _dropNulls(df: CPtr): CPtr {
+        return new CPtr(this._drop_nulls.call([df.handle()]), false, -1)
+    }
+    public _dropNullsIn(df: CPtr, colsCsv: string): CPtr {
+        return new CPtr(this._drop_nulls_in.call([df.handle(), colsCsv]), false, -1)
+    }
+    public _groupByAgg(df: CPtr, byCsv: string, aggSpecs: string): CPtr {
+        return new CPtr(this._group_by_agg.call([df.handle(), byCsv, aggSpecs]), false, -1)
+    }
+    public _joinOf(left: CPtr, right: CPtr, leftCsv: string, rightCsv: string, how: string): CPtr {
+        return new CPtr(
+            this._join.call([left.handle(), right.handle(), leftCsv, rightCsv, how]),
+            false,
+            -1
+        )
+    }
+    public _vstackOf(top: CPtr, bottom: CPtr): CPtr {
+        return new CPtr(this._vstack.call([top.handle(), bottom.handle()]), false, -1)
+    }
+
+    public _heightOf(df: CPtr): int {
+        return this._height.call([df.handle()])
+    }
+    public _widthOf(df: CPtr): int {
+        return this._width.call([df.handle()])
+    }
+    public _columnsCsv(df: CPtr): string {
+        return this.__readAndFreeStr(this._columns_csv.call([df.handle()]))
+    }
+    public _dtypesCsv(df: CPtr): string {
+        return this.__readAndFreeStr(this._dtypes_csv.call([df.handle()]))
+    }
+    public _nullCountsCsv(df: CPtr): string {
+        return this.__readAndFreeStr(this._null_counts_csv.call([df.handle()]))
+    }
+
+    public _colCount(df: CPtr, col: string): int {
+        return this._col_count.call([df.handle(), col])
+    }
+
+    public _colScalar(df: CPtr, col: string, fn: CFunc, label: string): float {
+        const out: CPtr = c.alloc(8)
+        const rc: int = fn.call([df.handle(), col, out.handle()])
+        if (rc < 0) {
+            throw new Error("chuks_polars: " + label + " failed for column " + col)
+        }
+        if (rc == 0) {
+            throw new Error("chuks_polars: " + label + " on all-null column " + col)
+        }
+        return c.derefDouble(out)
+    }
+
+    public _getStr(df: CPtr, col: string, row: int): string {
+        const sptr: any = this._get_str.call([df.handle(), col, row])
+        const wrap: CPtr = new CPtr(sptr, false, -1)
+        if (wrap.isNull()) {
+            throw new Error("chuks_polars: pl_get_str out of range (col=" + col + ", row=" + row + ")")
+        }
+        const out: string = c.string(wrap)
+        this._free_string.call([sptr])
+        return out
+    }
+
+    /*
+     Bulk column read. The shim joins every value with `\x01` (SOH) so
+     the result is a single C-string we split on the Chuks side. SOH is
+     used because it cannot legally appear in normal text data.
+     */
+    public _columnStr(df: CPtr, col: string): []string {
+        const SEP: int = 1
+        const sptr: any = this._col_str.call([df.handle(), col, SEP])
+        const wrap: CPtr = new CPtr(sptr, false, -1)
+        if (wrap.isNull()) {
+            throw new Error("chuks_polars: pl_col_str failed for col=" + col)
+        }
+        const joined: string = c.string(wrap)
+        this._free_string.call([sptr])
+        if (joined == "") {
+            return []string{}
+        }
+        return joined.split("\x01")
+    }
+
+    /*
+     Fast numeric column read. Allocates `n*8` bytes, asks the shim to
+     write f64 values directly, and decodes the buffer in one FFI call.
+     */
+    public _columnF64(df: CPtr, col: string, n: int): []float {
+        if (n <= 0) {
+            return []float{}
+        }
+        const cap: int = n * 8
+        const buf: CPtr = c.alloc(cap)
+        const rc: int = this._col_f64.call([df.handle(), col, buf.handle(), cap])
+        if (rc < 0) {
+            buf.free()
+            throw new Error("chuks_polars: pl_col_f64 failed for col=" + col)
+        }
+        const out: []float = c.readDoubleSlice(buf, n)
+        buf.free()
+        return out
+    }
+
+    /*
+     Execute a lazy-Series JSON plan inside the Rust shim and return
+     the resulting column as `[]float`. Bool/int/null are cast to f64
+     by the shim. One FFI crossing for arbitrarily long fluent chains.
+     */
+    public _seriesExecF64(df: CPtr, planJson: string, n: int): []float {
+        if (n <= 0) {
+            return []float{}
+        }
+        const cap: int = n * 8
+        const buf: CPtr = c.alloc(cap)
+        const rc: int = this._series_exec_f64.call([df.handle(), planJson, buf.handle(), cap])
+        if (rc < 0) {
+            buf.free()
+            throw new Error("chuks_polars: pl_series_exec_f64 failed for plan=" + planJson)
+        }
+        const out: []float = c.readDoubleSlice(buf, n)
+        buf.free()
+        return out
+    }
+
+    /*
+     Allocates a `(rows * ncols * 8)` byte buffer and asks the shim to
+     fill it with the requested columns in flat row-major order. One
+     FFI call replaces N column extractions + a Chuks-level transpose +
+     a downstream `_packMatrix` flatten. Caller owns the returned buffer
+     and must `.free()` it.
+     */
+    public _matrixF64Buf(df: CPtr, cols: []string, rows: int): CPtr {
+        const nc: int = cols.length
+        if (rows <= 0 || nc == 0) {
+            return c.alloc(1)
+        }
+        const cap: int = rows * nc * 8
+        const buf: CPtr = c.alloc(cap)
+        const csv: string = cols.join(",")
+        const rc: int = this._matrix_f64.call([df.handle(), csv, buf.handle(), cap])
+        if (rc < 0) {
+            buf.free()
+            throw new Error("chuks_polars: pl_matrix_f64 failed (cols=" + csv + ")")
+        }
+        return buf
+    }
+
+    /*
+     Bulk lexicographically-sorted categorical encoding. Returns a tuple
+     of (codes, categories) where:
+     - codes      is `[]int` of length `n` (one per row, null -> -1)
+     - categories is `[]string`, sorted ascending
+     All work happens in the Rust shim — no per-cell FFI, no Chuks-side
+     hash-map / sort loop. This is the workhorse behind
+     `dataFrameToCategorical`'s fast path.
+     */
+    public _columnCategorical(df: CPtr, col: string, n: int): []any {
+        const SEP: int = 1
+        const cap: int = n * 8
+        const codes_buf: CPtr = c.alloc(cap)
+        const sptr: any = this._col_categorical.call(
+            [df.handle(), col, SEP, codes_buf.handle(), cap]
+        )
+        const wrap: CPtr = new CPtr(sptr, false, -1)
+        if (wrap.isNull()) {
+            codes_buf.free()
+            throw new Error("chuks_polars: pl_col_categorical failed for col=" + col)
+        }
+        const joined: string = c.string(wrap)
+        this._free_string.call([sptr])
+        const codes: []int = c.readInt64Slice(codes_buf, n)
+        codes_buf.free()
+        var cats: []string = []string{}
+        if (joined != "") {
+            cats = joined.split("\x01")
+        }
+        return [codes, cats]
+    }
+
+    public _writeCsv(df: CPtr, path: string): int {
+        return this._write_csv.call([df.handle(), path])
+    }
+    public _writeParquet(df: CPtr, path: string): int {
+        return this._write_parquet.call([df.handle(), path])
+    }
+
+    public _callToString(df: CPtr): string {
+        return this.__readAndFreeStr(this._to_string.call([df.handle()]))
+    }
+
+    public _freeDf(df: CPtr): void {
+        this._free_df.call([df.handle()])
+    }
+
+    // ── Internal helpers ───────────────────────────────────────────
+
+    private __readAndFreeStr(sptr: any): string {
+        const wrap: CPtr = new CPtr(sptr, false, -1)
+        if (wrap.isNull()) {
+            return ""
+        }
+        const out: string = c.string(wrap)
+        this._free_string.call([sptr])
+        return out
+    }
+
+    // Helper used by DataFrame to parse the comma-joined column lists.
+    public static _splitCsv(s: string): []string {
+        if (s.length == 0) {
+            return []
+        }
+        return s.split(",")
+    }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "@chuks/polars",
+  "version": "1.0.0",
+  "description": "Column-oriented analytics for Chuks, powered by the polars Rust crate. Read CSV / Parquet, select, filter, group, join, aggregate, compute column expressions, render tables, and plot, all at native speed.",
+  "entry": "src/index.chuks",
+  "author": "Chuks Team",
+  "license": "MIT",
+  "keywords": ["polars", "dataframe", "rust", "ffi", "analytics", "csv"],
+  "repository": "https://github.com/chuks-lang/chuks_polars",
+  "dependencies": {}
+}

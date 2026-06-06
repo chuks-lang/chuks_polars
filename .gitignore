@@ -1,0 +1,26 @@
+# Build artifacts
+tests/
+docs/
+build/
+shim/target/
+shim/Cargo.lock.bak
+
+# Native libraries (built locally; published separately as prebuilts)
+*.dylib
+*.so
+*.dll
+*.dSYM/
+
+# Chuks runtime
+chuks_packages/
+.prebuilt/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs
+*.log
