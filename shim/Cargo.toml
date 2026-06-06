@@ -21,3 +21,16 @@ polars = { version = "0.46", features = [
     "cross_join",
 ] }
 serde_json = "1"
+
+# Release profile tuned to keep the cdylib under the registry's 50 MB cap.
+# The default release build of a polars cdylib is ~63 MB (unstripped); stripping
+# symbols plus fat LTO and a single codegen unit gets it well under the cap
+# while preserving runtime speed (opt-level stays at 3). panic = "abort" drops
+# unwinding tables — safe here because the FFI shim never relies on
+# std::panic::catch_unwind.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
