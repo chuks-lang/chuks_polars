@@ -812,14 +812,12 @@ export class Series {
         // Minimal JSON string escape — handle backslash and double quote.
         // Polars column names are virtually never going to contain control
         // characters, but escape both backslash and quote defensively.
+        // By character, not byte: a byte-stepping substring drops a non-ASCII name.
         const out: []string = []
-        var i: int = 0
-        while (i < s.length) {
-            const c2: string = s.substring(i, i + 1)
+        for (var c2 of s) {
             if (c2 == "\\") { out.push("\\\\") }
             else if (c2 == "\"") { out.push("\\\"") }
             else { out.push(c2) }
-            i = i + 1
         }
         return out.join("")
     }
